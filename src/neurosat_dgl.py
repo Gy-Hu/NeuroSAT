@@ -118,13 +118,13 @@ class NeuroSAT(nn.Module):
         super().__init__()
         self.dim = dim
         self.n_rounds = n_rounds
-        self.convergence_threshold = 0.01  # 早停机制的收敛阈值
+        self.convergence_threshold = 0.01  # Convergence threshold for early stopping
         
         # Embeddings initialization
         self.lit_init = nn.Linear(1, dim)
         self.clause_init = nn.Linear(1, dim)
         
-        # 添加注意力层 (优化4)
+        # Add attention layers (Optimization 4)
         self.lit_attn = nn.Sequential(
             nn.Linear(dim*2, dim), nn.ReLU(),
             nn.Linear(dim, 1)
@@ -150,7 +150,7 @@ class NeuroSAT(nn.Module):
         self.lit_update = nn.LSTMCell(dim * 2, dim)
         self.clause_update = nn.LSTMCell(dim, dim)
         
-        # 添加批归一化层 (优化6)
+        # Add batch normalization layers (Optimization 6)
         self.lit_norm = nn.BatchNorm1d(dim)
         self.clause_norm = nn.BatchNorm1d(dim)
         
@@ -162,13 +162,13 @@ class NeuroSAT(nn.Module):
         )
         
     def apply_lit_attention(self, edges):
-        # 计算注意力权重
+        # Calculate attention weights
         attn_input = torch.cat([edges.src['h'], edges.dst['h']], dim=1)
         attn_weight = torch.sigmoid(self.lit_attn(attn_input))
         return {'l2c': self.lit_msg(edges.src['h']) * attn_weight}
     
     def apply_clause_attention(self, edges):
-        # 计算注意力权重
+        # Calculate attention weights
         attn_input = torch.cat([edges.src['h'], edges.dst['h']], dim=1)
         attn_weight = torch.sigmoid(self.clause_attn(attn_input))
         return {'c2l': self.clause_msg(edges.src['h']) * attn_weight}
@@ -181,7 +181,7 @@ class NeuroSAT(nn.Module):
         n_vars = g.n_vars
         n_clauses = g.num_nodes('clause')
         
-        # 动态轮数计算 (优化1)
+        # Dynamic rounds calculation (Optimization 1)
         dynamic_rounds = min(self.n_rounds, int(np.log(n_lits + n_clauses) * 4))
         
         # Initialize node features
@@ -193,13 +193,13 @@ class NeuroSAT(nn.Module):
         clause_h = self.clause_init(ones)
         clause_c = torch.zeros_like(clause_h)
         
-        # 早停机制的状态跟踪 (优化2)
+        # State tracking for early stopping (Optimization 2)
         prev_lit_h = None
         converged = False
 
         # Message passing rounds
         for r in range(dynamic_rounds):
-            # 存储前一轮状态用于早停检查
+            # Store previous state for early stopping check
             if prev_lit_h is None:
                 prev_lit_h = lit_h.clone().detach()
             
@@ -207,7 +207,7 @@ class NeuroSAT(nn.Module):
             g.nodes['clause'].data['h'] = clause_h
 
             # Literal to clause messages
-            # 使用注意力机制 (优化4)
+            # Use attention mechanism (Optimization 4)
             g.apply_edges(self.apply_lit_attention, etype='in')
             g.update_all(fn.copy_e('l2c', 'm'), fn.sum('m', 'agg_l'), etype='in')
 
@@ -215,16 +215,16 @@ class NeuroSAT(nn.Module):
             clause_h_agg = g.nodes['clause'].data['agg_l']
             clause_h_new, clause_c = self.clause_update(clause_h_agg, (clause_h, clause_c))
             
-            # 添加残差连接 (优化5)
+            # Add residual connection (Optimization 5)
             clause_h = clause_h + clause_h_new
             
-            # 应用批归一化 (优化6)
-            if g.num_nodes('clause') > 1:  # 批归一化需要至少2个样本
+            # Apply batch normalization (Optimization 6)
+            if g.num_nodes('clause') > 1:  # Batch normalization needs at least 2 samples
                 clause_h = self.clause_norm(clause_h)
 
             # Clause to literal messages
             g.nodes['clause'].data['h'] = clause_h
-            # 使用注意力机制 (优化4)
+            # Use attention mechanism (Optimization 4)
             g.apply_edges(self.apply_clause_attention, etype='to')
             g.update_all(fn.copy_e('c2l', 'm'), fn.sum('m', 'agg_c'), etype='to')
 
@@ -238,14 +238,14 @@ class NeuroSAT(nn.Module):
             lit_input = torch.cat([clause_h_agg, flipped_h], dim=1)
             lit_h_new, lit_c = self.lit_update(lit_input, (lit_h, lit_c))
             
-            # 添加残差连接 (优化5)
+            # Add residual connection (Optimization 5)
             lit_h = lit_h + lit_h_new
             
-            # 应用批归一化 (优化6)
-            if g.num_nodes('lit') > 1:  # 批归一化需要至少2个样本
+            # Apply batch normalization (Optimization 6)
+            if g.num_nodes('lit') > 1:  # Batch normalization needs at least 2 samples
                 lit_h = self.lit_norm(lit_h)
             
-            # 早停检查 (优化2)
+            # Early stopping check (Optimization 2)
             change = torch.norm(lit_h - prev_lit_h) / (torch.norm(prev_lit_h) + 1e-6)
             if change < self.convergence_threshold:
                 break
