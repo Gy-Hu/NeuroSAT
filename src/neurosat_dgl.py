@@ -88,8 +88,87 @@ def generate_sat_problem(n_vars, p_k_2=0.3, p_geo=0.4):
     return g_sat, g_unsat, 1.0, 0.0  # Return graphs and labels
 
 
-def generate_batch(min_n, max_n, batch_size):
-    """Generate a batch of SAT problems with balanced labels."""
+def generate_problem_pairs(n_pairs, min_n, max_n):
+    """Generate a large pool of problem pairs for training.
+    
+    Args:
+        n_pairs: Number of problem pairs to generate
+        min_n: Minimum number of variables
+        max_n: Maximum number of variables
+        
+    Returns:
+        problem_pairs: List of tuples (graph, label, n_vars)
+    """
+    problem_pairs = []
+    
+    print(f"Generating {n_pairs} problem pairs...")
+    for i in tqdm(range(n_pairs)):
+        n_vars = random.randint(min_n, max_n)
+        g_sat, g_unsat, label_sat, label_unsat = generate_sat_problem(n_vars)
+        
+        # Randomly choose one variant for the pair
+        if random.random() < 0.5:
+            problem_pairs.append((g_sat, torch.tensor([label_sat], dtype=torch.float), n_vars))
+        else:
+            problem_pairs.append((g_unsat, torch.tensor([label_unsat], dtype=torch.float), n_vars))
+    
+    return problem_pairs
+
+
+def create_batch_from_problems(problems, max_nodes_per_batch):
+    """Create batches from problem pairs, respecting maximum nodes per batch.
+    
+    Args:
+        problems: List of problem pairs (graph, label, n_vars)
+        max_nodes_per_batch: Maximum number of nodes allowed in a batch
+        
+    Returns:
+        batches: List of batched graphs and their labels
+    """
+    # Sort problems by size for more efficient batching
+    problems.sort(key=lambda x: x[0].num_nodes('lit') + x[0].num_nodes('clause'))
+    
+    batches = []
+    current_batch_graphs = []
+    current_batch_labels = []
+    current_batch_n_vars = []
+    current_nodes = 0
+    
+    for graph, label, n_vars in problems:
+        nodes_in_graph = graph.num_nodes('lit') + graph.num_nodes('clause')
+        
+        # If adding this graph would exceed max_nodes_per_batch, start a new batch
+        if current_batch_graphs and current_nodes + nodes_in_graph > max_nodes_per_batch:
+            # Create a batch from accumulated graphs
+            batched_graph = dgl.batch(current_batch_graphs)
+            batched_graph.n_vars_list = current_batch_n_vars
+            batched_graph.n_vars = max(current_batch_n_vars)
+            batches.append((batched_graph, torch.stack(current_batch_labels)))
+            
+            # Start a new batch
+            current_batch_graphs = [graph]
+            current_batch_labels = [label]
+            current_batch_n_vars = [n_vars]
+            current_nodes = nodes_in_graph
+        else:
+            # Add to current batch
+            current_batch_graphs.append(graph)
+            current_batch_labels.append(label)
+            current_batch_n_vars.append(n_vars)
+            current_nodes += nodes_in_graph
+    
+    # Don't forget the last batch
+    if current_batch_graphs:
+        batched_graph = dgl.batch(current_batch_graphs)
+        batched_graph.n_vars_list = current_batch_n_vars
+        batched_graph.n_vars = max(current_batch_n_vars)
+        batches.append((batched_graph, torch.stack(current_batch_labels)))
+    
+    return batches
+
+
+def generate_fixed_batch(min_n, max_n, batch_size):
+    """Generate a fixed-size batch of SAT problems with balanced labels (legacy method)."""
     graphs = []
     labels = []
     n_vars_list = []
@@ -174,6 +253,81 @@ class NeuroSAT(nn.Module):
         attn_weight = torch.sigmoid(self.clause_attn(attn_input))
         return {'c2l': self.clause_msg(edges.src['h']) * attn_weight}
     
+    def apply_correct_flipping(self, g, lit_h):
+        """Correctly flip literal states for batched graphs with different sizes.
+        
+        Args:
+            g: The batched DGL graph
+            lit_h: Current literal embeddings
+            
+        Returns:
+            flipped_h: Correctly flipped literal embeddings
+        """
+        flipped_h = torch.zeros_like(lit_h)
+        
+        # Process each graph in the batch separately
+        offset = 0
+        for i, num_nodes in enumerate(g.batch_num_nodes('lit')):
+            if hasattr(g, 'n_vars_list'):
+                curr_n_vars = g.n_vars_list[i]
+            else:
+                curr_n_vars = num_nodes // 2  # Assuming equal number of positive and negative literals
+                
+            # Calculate start indices for this graph in the batch
+            pos_start = offset
+            neg_start = offset + curr_n_vars
+            
+            # Flip positive and negative literals for this graph
+            flipped_h[pos_start:pos_start + curr_n_vars] = lit_h[neg_start:neg_start + curr_n_vars]
+            flipped_h[neg_start:neg_start + curr_n_vars] = lit_h[pos_start:pos_start + curr_n_vars]
+            
+            # If there are any additional literals, keep them unchanged
+            if num_nodes > 2 * curr_n_vars:
+                additional_start = offset + 2 * curr_n_vars
+                additional_count = num_nodes - 2 * curr_n_vars
+                flipped_h[additional_start:additional_start + additional_count] = lit_h[additional_start:additional_start + additional_count]
+            
+            # Update offset for the next graph
+            offset += num_nodes
+        
+        return flipped_h
+    
+    def check_convergence(self, g, lit_h, prev_lit_h, min_iterations, current_iteration):
+        """Check convergence for each individual graph in the batch.
+        
+        Args:
+            g: The batched DGL graph
+            lit_h: Current literal embeddings
+            prev_lit_h: Previous literal embeddings
+            min_iterations: Minimum number of iterations before checking convergence
+            current_iteration: Current iteration number
+            
+        Returns:
+            all_converged: Whether all graphs in the batch have converged
+        """
+        # Ensure minimum iterations are completed before checking convergence
+        if current_iteration < min_iterations or prev_lit_h is None:
+            return False
+            
+        # Process each graph in the batch separately
+        offset = 0
+        for i, num_nodes in enumerate(g.batch_num_nodes('lit')):
+            # Extract embeddings for this graph
+            curr_lit_h = lit_h[offset:offset + num_nodes]
+            prev_graph_lit_h = prev_lit_h[offset:offset + num_nodes]
+            
+            # Calculate change for this individual graph
+            graph_change = torch.norm(curr_lit_h - prev_graph_lit_h) / (torch.norm(prev_graph_lit_h) + 1e-6)
+            
+            # Check if this specific graph has converged
+            if graph_change >= self.convergence_threshold:
+                return False
+                
+            # Update offset for the next graph
+            offset += num_nodes
+        
+        return True
+    
     def forward(self, g):
         # Get graph info
         n_lits = g.num_nodes('lit') 
@@ -193,6 +347,9 @@ class NeuroSAT(nn.Module):
         
         # Dynamic rounds calculation (Optimization 1)
         dynamic_rounds = min(self.n_rounds, int(np.log(n_lits + n_clauses) * 4))
+
+        # Minimum iterations before checking convergence
+        min_iterations = 5
         
         # Initialize node features
         ones = torch.ones(n_lits, 1).to(g.device)
@@ -241,19 +398,8 @@ class NeuroSAT(nn.Module):
             # Update literal states with flipped states for negated literals
             clause_h_agg = g.nodes['lit'].data['agg_c']
             
-            # Create flipped version of literal states (positive <-> negative)
-            # Handle batch with different n_vars
-            if hasattr(g, 'n_vars_list'):
-                # More complex flipping for batched graphs with different n_vars
-                flipped_h = torch.zeros_like(lit_h)
-                # This is a simplified approach - in a real implementation, 
-                # you would need to handle each graph in the batch separately
-                # based on their individual n_vars values
-                flipped_h[:n_vars] = lit_h[n_vars:2*n_vars]
-                flipped_h[n_vars:2*n_vars] = lit_h[:n_vars]
-                flipped_h[2*n_vars:] = lit_h[2*n_vars:]  # Keep any additional literals unchanged
-            else:
-                flipped_h = torch.cat([lit_h[n_vars:], lit_h[:n_vars]], dim=0)
+            # Create flipped version of literal states using improved method
+            flipped_h = self.apply_correct_flipping(g, lit_h)
 
             # Concatenate messages and flipped states
             lit_input = torch.cat([clause_h_agg, flipped_h], dim=1)
@@ -268,17 +414,8 @@ class NeuroSAT(nn.Module):
             
             # Early stopping check (Optimization 2)
             # Improved early stopping that considers batch variance
-            with torch.no_grad():
-                change = torch.norm(lit_h - prev_lit_h) / (torch.norm(prev_lit_h) + 1e-6)
-                
-                # For batched graphs, we can use a more sophisticated convergence check
-                if hasattr(g, 'n_vars_list') and len(g.n_vars_list) > 1:
-                    # Only stop if the change is small enough for all samples
-                    if change < self.convergence_threshold * 0.5:  # More strict for batches
-                        break
-                elif change < self.convergence_threshold:
-                    break
-                
+            if self.check_convergence(g, lit_h, prev_lit_h, min_iterations, r):
+                break
             prev_lit_h = lit_h.clone().detach()
 
         # Voting
@@ -317,6 +454,7 @@ class NeuroSAT(nn.Module):
 def train(args):
     """Train the NeuroSAT model."""
     # DGL does not currently support MPS, so we use CUDA or CPU
+    print("Initializing training")
     if torch.cuda.is_available():
         device = torch.device('cuda')
     else:
@@ -327,7 +465,7 @@ def train(args):
     
     # Loss function and optimizer
     criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-10)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr if args.lr else 0.00002, weight_decay=1e-10)
     
     # Restore from checkpoint if provided
     start_epoch = 0
@@ -342,7 +480,25 @@ def train(args):
     print(f'Training on {device} for {args.epochs} epochs')
     
     # Make sure model directory exists
-    os.makedirs(args.model_dir, exist_ok=True)
+    model_dir = args.model_dir if args.model_dir else './model'
+    os.makedirs(model_dir, exist_ok=True)
+    
+    # Generate problems using approach similar to original implementation
+    print(f"Generating training data...")
+    n_pairs = args.n_pairs if args.n_pairs else 10000
+    max_nodes_per_batch = args.max_nodes_per_batch if args.max_nodes_per_batch else 12000
+    
+    train_problems = generate_problem_pairs(n_pairs, args.min_n, args.max_n)
+    # Shuffle to ensure good distribution of problems across batches
+    random.shuffle(train_problems)
+    train_batches = create_batch_from_problems(train_problems, max_nodes_per_batch)
+    
+    # For validation, use a smaller number of problems
+    val_problems = generate_problem_pairs(n_pairs // 5, args.min_n, args.max_n)
+    random.shuffle(val_problems)
+    val_batches = create_batch_from_problems(val_problems, max_nodes_per_batch)
+    
+    print(f"Created {len(train_batches)} training batches and {len(val_batches)} validation batches")
     
     # Training loop
     for epoch in range(start_epoch, args.epochs):
@@ -350,28 +506,40 @@ def train(args):
         train_correct = 0
         train_total = 0
         train_loss = 0.0
+        batch_count = 0
+        
+        # Shuffle batches each epoch for better training
+        random.shuffle(train_batches)
+        # Limit number of batches per epoch if specified
+        batches_per_epoch = min(len(train_batches), args.train_batches) if args.train_batches else len(train_batches)
+        epoch_train_batches = train_batches[:batches_per_epoch]
         
         # Training batches
-        train_bar = tqdm(range(args.train_batches), desc=f'Epoch {epoch+1}/{args.epochs} (Train)')
-        for _ in train_bar:
-            # Generate a batch of problems
-            g, labels = generate_batch(args.min_n, args.max_n, args.batch_size)
+        train_bar = tqdm(epoch_train_batches, desc=f'Epoch {epoch+1}/{args.epochs} (Train)')
+        for g, labels in train_bar:
+            batch_count += 1
             g = g.to(device)
             labels = labels.to(device)
             
-            optimizer.zero_grad() 
+            optimizer.zero_grad()
             output = model(g)
             loss = criterion(output, labels)
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
-            train_correct += ((output > 0.5).float() == labels).sum().item()
-            train_total += labels.size(0)
+            batch_correct = ((output > 0.5).float() == labels).sum().item()
+            train_correct += batch_correct
+            batch_total = labels.size(0)
+            train_total += batch_total
      
-            train_bar.set_description( 
-                f'Epoch {epoch+1}/{args.epochs} (Train) - Loss: {train_loss/(_+1):.4f}, Acc: {train_correct/train_total:.3f}'
+            train_bar.set_description(
+                f'Epoch {epoch+1}/{args.epochs} (Train) - Loss: {train_loss/batch_count:.4f}, Acc: {train_correct/train_total:.3f}'
             )
+            
+        # Limit validation batches for faster evaluation
+        batches_per_val = min(len(val_batches), args.val_batches) if args.val_batches else len(val_batches)
+        epoch_val_batches = val_batches[:batches_per_val]
         
         # Validation
         model.eval()
@@ -379,12 +547,8 @@ def train(args):
         val_total = 0
 
         with torch.no_grad():
-            val_bar = tqdm(range(args.val_batches), desc=f'Epoch {epoch+1}/{args.epochs} (Val)')
-            for _ in val_bar:
-                # Generate a batch of problems
-                g, labels = generate_batch(args.min_n, args.max_n, args.batch_size)
-                g = g.to(device)
-                labels = labels.to(device)
+            val_bar = tqdm(epoch_val_batches, desc=f'Epoch {epoch+1}/{args.epochs} (Val)')
+            for g, labels in val_bar:
                 
                 output = model(g)
                 
@@ -397,7 +561,7 @@ def train(args):
                 )
         
         # Calculate metrics
-        train_acc = train_correct / train_total
+        train_acc = train_correct / (train_total or 1)  # Avoid division by zero
         val_acc = val_correct / val_total
         
         print(f'Epoch {epoch+1}/{args.epochs}:')
@@ -412,7 +576,7 @@ def train(args):
         }
         
         # Save last model
-        torch.save(checkpoint, os.path.join(args.model_dir, f'neurosat_dgl_last.pth'))
+        torch.save(checkpoint, os.path.join(model_dir, f'neurosat_dgl_last.pth'))
         
         # Save best model
         if val_acc > best_acc:
@@ -456,6 +620,8 @@ def evaluate(args):
             end_time = time.time()
             
             correct += ((output > 0.5).float() == labels).sum().item()
+            batch_correct = ((output > 0.5).float() == labels).sum().item()
+            batch_total = labels.size(0)
             total += labels.size(0)
             times = []  # Initialize times list if not already done
             times.append((end_time - start_time) * 1000 / args.batch_size)  # Average ms per sample
@@ -482,13 +648,17 @@ def main():
     # Data parameters
     parser.add_argument('--min_n', type=int, default=10, help='Min number of variables')
     parser.add_argument('--max_n', type=int, default=40, help='Max number of variables')
+    # Add original implementation parameters
+    parser.add_argument('--n_pairs', type=int, default=10000, help='Number of problem pairs to generate')
+    parser.add_argument('--max_nodes_per_batch', type=int, default=12000, 
+                        help='Maximum number of nodes allowed in a batch')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--train_batches', type=int, default=100, help='Batches per epoch')
     parser.add_argument('--val_batches', type=int, default=20, help='Validation batches')
-    parser.add_argument('--lr', type=float, default=0.00002, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     
     # Testing parameters
     parser.add_argument('--test_batches', type=int, default=50, help='Test batches')

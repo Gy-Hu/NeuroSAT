@@ -122,40 +122,6 @@ cd ..
 pip install torch dgl numpy tqdm
 ```
 
-## Quick Start
-
-For a quick test run with lightweight parameters:
-
-```bash
-# Activate your environment if needed
-# source ~/miniconda3/bin/activate your_env_name
-
-# Train a lightweight model (faster for testing)
-PYTHONPATH=$PYTHONPATH:$(pwd)/PyMiniSolvers python src/neurosat_dgl.py \
-    --mode train \
-    --dim 64 \
-    --n_rounds 10 \
-    --min_n 10 \
-    --max_n 20 \
-    --epochs 5 \
-    --batch_size 16 \
-    --train_batches 10 \
-    --val_batches 5 \
-    --lr 0.0001 \
-    --model_dir ./model
-
-# Evaluate the model
-PYTHONPATH=$PYTHONPATH:$(pwd)/PyMiniSolvers python src/neurosat_dgl.py \
-    --mode eval \
-    --dim 64 \
-    --n_rounds 10 \
-    --min_n 10 \
-    --max_n 20 \
-    --batch_size 16 \
-    --test_batches 10 \
-    --restore ./model/neurosat_dgl_best.pth
-```
-
 ## Usage
 
 ### Training
@@ -169,28 +135,13 @@ PYTHONPATH=$PYTHONPATH:$(pwd)/PyMiniSolvers python src/neurosat_dgl.py \
     --n_rounds 26 \
     --min_n 10 \
     --max_n 40 \
-    --epochs 200 \
-    --batch_size 32 \
-    --train_batches 100 \
+    --epochs 50 \
+    --n_pairs 10000 \
+    --max_nodes_per_batch 12000 \
+    --train_batches 50 \
     --val_batches 20 \
     --lr 0.00002 \
     --model_dir ./model
-```
-
-### Evaluation
-
-To evaluate a trained model:
-
-```bash
-PYTHONPATH=$PYTHONPATH:$(pwd)/PyMiniSolvers python src/neurosat_dgl.py \
-    --mode eval \
-    --dim 128 \
-    --n_rounds 26 \
-    --min_n 40 \
-    --max_n 40 \
-    --batch_size 32 \
-    --test_batches 50 \
-    --restore ./model/neurosat_dgl_best.pth
 ```
 
 ## Hardware Acceleration Notes
