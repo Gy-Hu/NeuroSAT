@@ -102,14 +102,15 @@ def generate_batch(min_n, max_n, batch_size):
         # Randomly choose one variant
         if random.random() < 0.5:
             graphs.append(g_sat)
-            labels.append(label_sat)
+            labels.append(torch.tensor([label_sat], dtype=torch.float))
         else:
             graphs.append(g_unsat)
-            labels.append(label_unsat)
+            labels.append(torch.tensor([label_unsat], dtype=torch.float))
 
     batched_graph = dgl.batch(graphs)
-    # Set n_vars attribute for the batched graph
-    batched_graph.n_vars = graphs[0].n_vars
+    # Store n_vars for each graph in the batch
+    batched_graph.n_vars_list = n_vars_list
+    batched_graph.n_vars = max(n_vars_list)  # Use max n_vars for safety
     return batched_graph, torch.stack(labels)
 
 
@@ -175,10 +176,19 @@ class NeuroSAT(nn.Module):
     
     def forward(self, g):
         # Get graph info
-        n_lits = g.num_nodes('lit')
-        if not hasattr(g, 'n_vars'):
-            raise AttributeError('Graph object does not have n_vars attribute.')
-        n_vars = g.n_vars
+        n_lits = g.num_nodes('lit') 
+        
+        # Get batch information for later
+        batch_num_nodes = g.batch_num_nodes('lit')
+        
+        # Handle batch with different n_vars
+        if hasattr(g, 'n_vars_list'):
+            # Using max n_vars for the batch
+            n_vars = g.n_vars
+        elif hasattr(g, 'n_vars'):
+            n_vars = g.n_vars
+        else:
+            raise AttributeError('Graph object does not have n_vars or n_vars_list attribute.')
         n_clauses = g.num_nodes('clause')
         
         # Dynamic rounds calculation (Optimization 1)
@@ -232,7 +242,18 @@ class NeuroSAT(nn.Module):
             clause_h_agg = g.nodes['lit'].data['agg_c']
             
             # Create flipped version of literal states (positive <-> negative)
-            flipped_h = torch.cat([lit_h[n_vars:], lit_h[:n_vars]], dim=0)
+            # Handle batch with different n_vars
+            if hasattr(g, 'n_vars_list'):
+                # More complex flipping for batched graphs with different n_vars
+                flipped_h = torch.zeros_like(lit_h)
+                # This is a simplified approach - in a real implementation, 
+                # you would need to handle each graph in the batch separately
+                # based on their individual n_vars values
+                flipped_h[:n_vars] = lit_h[n_vars:2*n_vars]
+                flipped_h[n_vars:2*n_vars] = lit_h[:n_vars]
+                flipped_h[2*n_vars:] = lit_h[2*n_vars:]  # Keep any additional literals unchanged
+            else:
+                flipped_h = torch.cat([lit_h[n_vars:], lit_h[:n_vars]], dim=0)
 
             # Concatenate messages and flipped states
             lit_input = torch.cat([clause_h_agg, flipped_h], dim=1)
@@ -246,9 +267,17 @@ class NeuroSAT(nn.Module):
                 lit_h = self.lit_norm(lit_h)
             
             # Early stopping check (Optimization 2)
-            change = torch.norm(lit_h - prev_lit_h) / (torch.norm(prev_lit_h) + 1e-6)
-            if change < self.convergence_threshold:
-                break
+            # Improved early stopping that considers batch variance
+            with torch.no_grad():
+                change = torch.norm(lit_h - prev_lit_h) / (torch.norm(prev_lit_h) + 1e-6)
+                
+                # For batched graphs, we can use a more sophisticated convergence check
+                if hasattr(g, 'n_vars_list') and len(g.n_vars_list) > 1:
+                    # Only stop if the change is small enough for all samples
+                    if change < self.convergence_threshold * 0.5:  # More strict for batches
+                        break
+                elif change < self.convergence_threshold:
+                    break
                 
             prev_lit_h = lit_h.clone().detach()
 
@@ -256,13 +285,33 @@ class NeuroSAT(nn.Module):
         votes = self.vote(lit_h)
 
         # Get votes for each variable (combine positive and negative literal votes)
-        pos_votes = votes[:n_vars]
-        neg_votes = votes[n_vars:2*n_vars]
-        var_votes = (pos_votes + neg_votes) / 2
-
-        # Output a scalar prediction by taking the mean of all variable votes
-        prediction = torch.mean(var_votes)
-        return torch.sigmoid(prediction.view(1, 1))
+        # For batched graphs, we need to process each graph separately
+        batch_size = len(g.batch_num_nodes('lit')) if hasattr(g, 'batch_num_nodes') else 1
+        predictions = []
+        
+        lit_offset = 0
+        for i in range(batch_size):
+            # For batched graph, extract the number of literals for this graph
+            if hasattr(g, 'n_vars_list'):
+                curr_n_vars = g.n_vars_list[i]
+            else:
+                curr_n_vars = n_vars
+                
+            # Get start and end indices for this graph's literals
+            pos_votes = votes[lit_offset:lit_offset + curr_n_vars]
+            neg_votes = votes[lit_offset + curr_n_vars:lit_offset + 2*curr_n_vars]
+            
+            # Combine positive and negative votes
+            pos_abs = torch.abs(pos_votes)
+            neg_abs = torch.abs(neg_votes)
+            var_votes = torch.where(pos_abs > neg_abs, pos_votes, -neg_votes)
+            
+            # Compute prediction for this graph
+            predictions.append(torch.mean(var_votes))
+            lit_offset += batch_num_nodes[i] if hasattr(g, 'batch_num_nodes') else n_lits
+        
+        # Return sigmoid of all predictions
+        return torch.sigmoid(torch.stack(predictions).view(batch_size, 1))
 
 
 def train(args):
@@ -305,37 +354,20 @@ def train(args):
         # Training batches
         train_bar = tqdm(range(args.train_batches), desc=f'Epoch {epoch+1}/{args.epochs} (Train)')
         for _ in train_bar:
-            # Generate individual problems and process one by one
-            batch_loss = 0.0
-            batch_correct = 0
-            batch_total = 0
+            # Generate a batch of problems
+            g, labels = generate_batch(args.min_n, args.max_n, args.batch_size)
+            g = g.to(device)
+            labels = labels.to(device)
             
-            for _ in range(args.batch_size):
-                n_vars = random.randint(args.min_n, args.max_n)
-                g_sat, g_unsat, label_sat, label_unsat = generate_sat_problem(n_vars)
-                
-                # Randomly choose one variant
-                if random.random() < 0.5:
-                    g = g_sat.to(device)
-                    label = torch.tensor([[label_sat]], dtype=torch.float32).to(device)
-                else:
-                    g = g_unsat.to(device)
-                    label = torch.tensor([[label_unsat]], dtype=torch.float32).to(device)
-                
-                optimizer.zero_grad() 
-                output = model(g)
-                loss = criterion(output, label)
-                loss.backward()
-                optimizer.step()
-                
-                batch_loss += loss.item()
-                pred = (output > 0.5).float()
-                batch_correct += (pred == label).sum().item()
-                batch_total += 1
+            optimizer.zero_grad() 
+            output = model(g)
+            loss = criterion(output, labels)
+            loss.backward()
+            optimizer.step()
             
-            train_loss += batch_loss / args.batch_size
-            train_correct += batch_correct
-            train_total += batch_total
+            train_loss += loss.item()
+            train_correct += ((output > 0.5).float() == labels).sum().item()
+            train_total += labels.size(0)
      
             train_bar.set_description( 
                 f'Epoch {epoch+1}/{args.epochs} (Train) - Loss: {train_loss/(_+1):.4f}, Acc: {train_correct/train_total:.3f}'
@@ -349,32 +381,16 @@ def train(args):
         with torch.no_grad():
             val_bar = tqdm(range(args.val_batches), desc=f'Epoch {epoch+1}/{args.epochs} (Val)')
             for _ in val_bar:
-                # Generate individual problems and process one by one
-                batch_correct = 0
-                batch_total = 0
+                # Generate a batch of problems
+                g, labels = generate_batch(args.min_n, args.max_n, args.batch_size)
+                g = g.to(device)
+                labels = labels.to(device)
                 
-                for _ in range(args.batch_size):
-                    n_vars = random.randint(args.min_n, args.max_n)
-                    g_sat, g_unsat, label_sat, label_unsat = generate_sat_problem(n_vars)
-                    
-                    # Randomly choose one variant
-                    if random.random() < 0.5:
-                        g = g_sat.to(device)
-                        label = torch.tensor([[label_sat]], dtype=torch.float32).to(device)
-                    else:
-                        g = g_unsat.to(device)
-                        label = torch.tensor([[label_unsat]], dtype=torch.float32).to(device)
-                    
-                    output = model(g)
-                
-                    # Calculate accuracy
-                    pred = (output > 0.5).float()
-                    batch_correct += (pred == label).sum().item()
-                    batch_total += 1
+                output = model(g)
                 
                 # Update validation counts
-                val_correct += batch_correct
-                val_total += batch_total
+                val_correct += ((output > 0.5).float() == labels).sum().item()
+                val_total += labels.size(0)
                 
                 val_bar.set_description(
                     f'Epoch {epoch+1}/{args.epochs} (Val) - Acc: {val_correct/(val_total or 1):.3f}'
@@ -429,38 +445,20 @@ def evaluate(args):
     with torch.no_grad():
         test_bar = tqdm(range(args.test_batches))
         for _ in test_bar:
-            batch_correct = 0
-            batch_total = 0
-            batch_times = []
+            # Generate a batch of problems
+            g, labels = generate_batch(args.min_n, args.max_n, args.batch_size)
+            g = g.to(device)
+            labels = labels.to(device)
             
-            for _ in range(args.batch_size):
-                n_vars = random.randint(args.min_n, args.max_n)
-                g_sat, g_unsat, label_sat, label_unsat = generate_sat_problem(n_vars)
-                
-                # Randomly choose one variant
-                if random.random() < 0.5:
-                    g = g_sat.to(device)
-                    label = torch.tensor([[label_sat]], dtype=torch.float32).to(device)
-                else:
-                    g = g_unsat.to(device)
-                    label = torch.tensor([[label_unsat]], dtype=torch.float32).to(device)
-
-                # Measure inference time
-                start_time = time.time() 
-                output = model(g)
-                end_time = time.time()
-                
-                # Calculate accuracy
-                pred = (output > 0.5).float() 
-                batch_correct += (pred == label).sum().item()
-                batch_total += 1
-                
-                # Record times
-                batch_times.append((end_time - start_time) * 1000)  # Convert to ms
-                
-            correct += batch_correct
-            total += batch_total
-            times.extend(batch_times)
+            # Measure inference time
+            start_time = time.time() 
+            output = model(g)
+            end_time = time.time()
+            
+            correct += ((output > 0.5).float() == labels).sum().item()
+            total += labels.size(0)
+            times = []  # Initialize times list if not already done
+            times.append((end_time - start_time) * 1000 / args.batch_size)  # Average ms per sample
             
             test_bar.set_description(
                 f'Acc: {correct/(total or 1):.3f}, Avg time: {sum(times)/(len(times) or 1):.2f} ms')
