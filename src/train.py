@@ -26,11 +26,21 @@ if platform.system() == 'Darwin' and torch.backends.mps.is_available():
         # This allows MPS to use all available memory if needed
         os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
     
-    # Enable automatic garbage collection to free memory
-    gc.enable()
+    # Only enable garbage collection if explicitly requested
+    if not args.disable_gc:
+        gc.enable()
+    else:
+        gc.disable()
+        print("Garbage collection disabled for better performance")
     print("Using MPS (Metal Performance Shaders) for training")
 elif torch.cuda.is_available():
     device = torch.device('cuda')
+    # Only enable garbage collection if explicitly requested
+    if not args.disable_gc:
+        gc.enable()
+    else:
+        gc.disable()
+        print("Garbage collection disabled for better performance")
     print("Using CUDA for training")
 else:
     device = torch.device('cpu')
@@ -56,6 +66,10 @@ sigmoid  = nn.Sigmoid()
 
 # Function to clear memory cache
 def clear_memory():
+    # Skip memory clearing if garbage collection is disabled
+    if args.disable_gc:
+        return
+        
     if device.type == 'mps':
         if hasattr(torch.mps, 'empty_cache'):
             torch.mps.empty_cache()
@@ -88,6 +102,25 @@ if args.restore is not None:
   net.load_state_dict(model['state_dict'])
 
 for epoch in range(start_epoch, args.epochs):
+  # Function to determine the appropriate batch size based on problem size
+  def get_dynamic_batch_size(min_n, max_n):
+    if args.auto_batch_size:
+      if max_n <= 10:
+        return args.small_batch_size
+      elif max_n <= 40:
+        return args.medium_batch_size
+      else:
+        return args.large_batch_size
+    else:
+      return args.max_nodes_per_batch
+  
+  # Update max_nodes_per_batch based on problem size if auto_batch_size is enabled
+  if args.auto_batch_size:
+    original_batch_size = args.max_nodes_per_batch
+    args.max_nodes_per_batch = get_dynamic_batch_size(args.min_n, args.max_n)
+    print(f"Auto-adjusting batch size from {original_batch_size} to {args.max_nodes_per_batch} based on problem size (min_n={args.min_n}, max_n={args.max_n})",
+          file=log_file, flush=True)
+  
   if args.train_file is None:
     clear_memory()
     print('generate data online', file=log_file, flush=True)

@@ -39,10 +39,14 @@ echo "Starting training on SR(3-10) dataset..."
 python src/train.py \
   --task-name 'neurosat_No2' \
   --dim 128 \
-  --n_rounds 26 \
+  --n_rounds 40 \
   --epochs 10 \
   --n_pairs 100000 \
-  --max_nodes_per_batch 12000 \
+  --auto_batch_size \
+  --small_batch_size 12000 \
+  --medium_batch_size 6000 \
+  --large_batch_size 3000 \
+  --disable_gc \
   --data-dir '/Users/apple/coding_env/NeuroSAT/data' \
   --log-dir '/Users/apple/coding_env/NeuroSAT/log' \
   --model-dir '/Users/apple/coding_env/NeuroSAT/model' \

@@ -45,7 +45,10 @@ python src/train.py \
   --n_rounds 26 \
   --epochs 200 \
   --n_pairs 100000 \
-  --max_nodes_per_batch 3000 \
+  --auto_batch_size \
+  --small_batch_size 12000 \
+  --medium_batch_size 6000 \
+  --large_batch_size 3000 \
   --data-dir '/Users/apple/coding_env/NeuroSAT/data' \
   --log-dir '/Users/apple/coding_env/NeuroSAT/log' \
   --model-dir '/Users/apple/coding_env/NeuroSAT/model' \

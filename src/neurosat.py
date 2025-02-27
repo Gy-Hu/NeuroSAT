@@ -11,7 +11,10 @@ class NeuroSAT(nn.Module):
     self.args = args
     # Use the provided device or default to CPU
     self.device = device if device is not None else torch.device('cpu')
+    # Store whether garbage collection is disabled
+    self.disable_gc = args.disable_gc if hasattr(args, 'disable_gc') else False
 
+    # Create tensors directly on the target device to avoid transfers
     self.init_ts = torch.ones(1, device=self.device)
     self.init_ts.requires_grad = False
 
@@ -41,6 +44,16 @@ class NeuroSAT(nn.Module):
     if hasattr(problem, "L_unpack_indices"):
       problem.L_unpack_indices = [idx for idx in problem.L_unpack_indices]  # Keep this as a list
     return problem
+    
+  # Helper method to conditionally collect garbage
+  def _maybe_collect_garbage(self):
+    if not self.disable_gc:
+      if self.device.type == 'mps':
+        if hasattr(torch.mps, 'empty_cache'):
+          torch.mps.empty_cache()
+      elif self.device.type == 'cuda':
+        torch.cuda.empty_cache()
+      gc.collect()
 
   def forward(self, problem):
     # Move problem data to the correct device
@@ -52,137 +65,129 @@ class NeuroSAT(nn.Module):
     n_probs   = len(problem.is_sat)
     # print(n_vars, n_lits, n_clauses, n_probs)
 
-    # Ensure all tensors are moved to the correct device
+    # Create tensors directly on the target device to avoid transfers
     # Convert list of arrays to single numpy array for better performance
     ts_L_unpack_indices = torch.tensor(np.array(problem.L_unpack_indices), device=self.device).t().long()
     
+    # Create all tensors directly on the device to avoid transfers
     init_ts = self.init_ts
     # 1 x n_lits x dim & 1 x n_clauses x dim
     L_init = self.L_init(init_ts).view(1, 1, -1)
-    # print(L_init.shape)
     L_init = L_init.repeat(1, n_lits, 1)
     C_init = self.C_init(init_ts).view(1, 1, -1)
+    
     # Free memory after initialization
     init_ts = None
-    gc.collect()
-    # print(C_init.shape)
+    self._maybe_collect_garbage()
+    
     C_init = C_init.repeat(1, n_clauses, 1)
 
-    # print(L_init.shape, C_init.shape)
-
-    # Make sure all LSTM states are on the correct device
-    h0_L = L_init.to(self.device)
+    # Create LSTM states directly on the device
+    h0_L = L_init  # Already on device, no need for .to(self.device)
     c0_L = torch.zeros(1, n_lits, self.args.dim, device=self.device)
     L_state = (h0_L, c0_L)
     
-    h0_C = C_init.to(self.device)
+    h0_C = C_init  # Already on device, no need for .to(self.device)
     c0_C = torch.zeros(1, n_clauses, self.args.dim, device=self.device)
     C_state = (h0_C, c0_C)
+    
     # MPS doesn't support sparse tensors, so we need to handle this differently
     if self.device.type == 'mps':
         # Create a dense tensor directly without going through sparse format
-        # Use float16 for better memory efficiency on MPS
         L_unpack = torch.zeros(n_lits, n_clauses, dtype=torch.float32, device=self.device)
         for i in range(len(problem.L_unpack_indices[0])):
             L_unpack[ts_L_unpack_indices[0, i], ts_L_unpack_indices[1, i]] = 1.0
         # Free memory after creating L_unpack
         ts_L_unpack_indices = None
-        gc.collect()
+        self._maybe_collect_garbage()
     else:
         L_unpack = torch.sparse.FloatTensor(
             ts_L_unpack_indices,
             torch.ones(problem.n_cells, device=self.device),
             torch.Size([n_lits, n_clauses])
-        ).to_dense().to(self.device)
-
-    # print(ts_L_unpack_indices.shape)
+        ).to_dense()  # Already on device, no need for .to(self.device)
 
     for _ in range(self.args.n_rounds):
-      # n_lits x dim
-      # Clear cache before each round to reduce memory usage
-      if self.device.type == 'mps':
-        if hasattr(torch.mps, 'empty_cache'):
-          torch.mps.empty_cache()
-      elif self.device.type == 'cuda':
-        torch.cuda.empty_cache()
+      # Only clear cache if garbage collection is enabled
+      if not self.disable_gc:
+        if self.device.type == 'mps':
+          if hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+        elif self.device.type == 'cuda':
+          torch.cuda.empty_cache()
         
-      L_hidden = L_state[0].squeeze(0).to(self.device)
+      # Get hidden state - already on device, no need for .to(self.device)
+      L_hidden = L_state[0].squeeze(0)
       L_pre_msg = self.L_msg(L_hidden)
       
-      # (n_clauses x n_lits) x (n_lits x dim) = n_clauses x dim
       # Use more memory-efficient matrix multiplication
       L_unpack_t = L_unpack.t()
       LC_msg = torch.matmul(L_unpack_t, L_pre_msg)
+      
+      # Clean up intermediate tensors
       L_unpack_t = None
       L_pre_msg = None
-      gc.collect()
-      # print(L_hidden.shape, L_pre_msg.shape, LC_msg.shape)
+      self._maybe_collect_garbage()
 
-      # Make sure LSTM input is on the correct device
-      # Use half precision for LSTM operations to save memory on MPS
-      # LSTM requires float32 input, so we can't use float16 here
+      # LSTM update - all tensors already on device
       _, C_state = self.C_update(LC_msg.unsqueeze(0), C_state)
       
       LC_msg = None
-      gc.collect()
-      # print('C_state',C_state[0].shape, C_state[1].shape)
+      self._maybe_collect_garbage()
 
-      # n_clauses x dim
-      C_hidden = C_state[0].squeeze(0).to(self.device)
+      # Get hidden state - already on device, no need for .to(self.device)
+      C_hidden = C_state[0].squeeze(0)
       C_pre_msg = self.C_msg(C_hidden)
-      # (n_lits x n_clauses) x (n_clauses x dim) = n_lits x dim
+      
+      # Matrix multiplication - all tensors already on device
       CL_msg = torch.matmul(L_unpack, C_pre_msg)
+      
       C_pre_msg = None
-      gc.collect()
-      # print(C_hidden.shape, C_pre_msg.shape, CL_msg.shape)
+      self._maybe_collect_garbage()
 
       # Create the concatenated tensor for LSTM input
       flipped = self.flip(L_state[0].squeeze(0), n_vars)
       cat_tensor = torch.cat([CL_msg, flipped], dim=1)
+      
       CL_msg = None
       flipped = None
       
-      # LSTM requires float32 input
+      # LSTM update - all tensors already on device
       _, L_state = self.L_update(cat_tensor.unsqueeze(0), L_state)
       
       cat_tensor = None
-      gc.collect()
-      # print('L_state',C_state[0].shape, C_state[1].shape)
+      self._maybe_collect_garbage()
       
-    # Ensure final tensors are on correct device
-    logits = L_state[0].squeeze(0).to(self.device)
-    clauses = C_state[0].squeeze(0).to(self.device)
+    # Get final tensors - already on device, no need for .to(self.device)
+    logits = L_state[0].squeeze(0)
     
     # Free memory before final computation
     L_state = None
     C_state = None
     L_unpack = None
-    gc.collect()
+    self._maybe_collect_garbage()
 
-    # print(logits.shape, clauses.shape)
     vote = self.L_vote(logits)
-    # print('vote', vote.shape)
-    vote_join = torch.cat([vote[:n_vars, :], vote[n_vars:, :]], dim=1).to(self.device)
+    vote_join = torch.cat([vote[:n_vars, :], vote[n_vars:, :]], dim=1)
     
     vote = None
     logits = None
-    clauses = None
-    gc.collect()
+    self._maybe_collect_garbage()
     
-    # print('vote_join', vote_join.shape)
     self.vote = vote_join
     vote_join = vote_join.view(n_probs, -1, 2).view(n_probs, -1)
     vote_mean = torch.mean(vote_join, dim=1)
-    # print('mean', vote_mean.shape)
-    return vote_mean.to(self.device)
+    
+    # Already on device, no need for final .to(self.device)
+    return vote_mean
 
   def flip(self, msg, n_vars):
-    # Ensure tensors are on the correct device
-    msg = msg.to(self.device)
-    return torch.cat([msg[n_vars:2*n_vars, :], msg[:n_vars, :]], dim=0).to(self.device)
+    # No need to move to device, msg is already on the correct device
+    return torch.cat([msg[n_vars:2*n_vars, :], msg[:n_vars, :]], dim=0)
     
   def __del__(self):
     # Clean up memory when the model is deleted
-    if hasattr(torch.mps, 'empty_cache'):
-      torch.mps.empty_cache()
-    gc.collect()
+    if not self.disable_gc:
+      if hasattr(torch.mps, 'empty_cache'):
+        torch.mps.empty_cache()
+      gc.collect()
