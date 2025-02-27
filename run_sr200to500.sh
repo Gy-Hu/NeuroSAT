@@ -4,7 +4,7 @@
 #PBS -l nodes=1:ppn=1:gpus=1
 #PBS -o $PBS_JOBID.o
 #PBS -e $PBS_JOBID.e
-#PBS -d /home/zhangfan-mff/projects/neurosat/pytorch_neurosat/
+#PBS -d /Users/apple/coding_env/NeuroSAT/
 
 python src/train.py \
   --task-name 'neurosat' \
@@ -13,7 +13,7 @@ python src/train.py \
   --epochs 500 \
   --n_pairs 50000 \
   --max_nodes_per_batch 15000 \
-  --gen_log '/home/zhangfan-mff/projects/neurosat/pytorch_neurosat/log/data_maker_sr200t500.log' \
+  --gen_log '/Users/apple/coding_env/NeuroSAT/log/data_maker_sr200t500.log' \
   --min_n 200 \
   --max_n 500 \
   --val-file 'val_v500_vpb15000_b2564.pkl'

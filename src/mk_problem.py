@@ -46,7 +46,7 @@ class Problem(object):
         self.dimacs = all_dimacs
 
     def compute_L_unpack(self, iclauses):
-        self.L_unpack_indices = np.zeros([self.n_cells, 2], dtype=np.int)
+        self.L_unpack_indices = np.zeros([self.n_cells, 2], dtype=np.int64)
         cell = 0
         for clause_idx, iclause in enumerate(iclauses):
             vlits = [ilit_to_vlit(x, self.n_vars) for x in iclause]

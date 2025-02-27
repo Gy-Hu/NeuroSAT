@@ -7,8 +7,9 @@ class NeuroSAT(nn.Module):
   def __init__(self, args):
     super(NeuroSAT, self).__init__()
     self.args = args
+    self.device = torch.device('cpu')
 
-    self.init_ts = torch.ones(1)
+    self.init_ts = torch.ones(1, device=self.device)
     self.init_ts.requires_grad = False
 
     self.L_init = nn.Linear(1, args.dim)
@@ -33,9 +34,9 @@ class NeuroSAT(nn.Module):
     n_probs   = len(problem.is_sat)
     # print(n_vars, n_lits, n_clauses, n_probs)
 
-    ts_L_unpack_indices = torch.Tensor(problem.L_unpack_indices).t().long()
+    ts_L_unpack_indices = torch.Tensor(problem.L_unpack_indices).t().long().to(self.device)
     
-    init_ts = self.init_ts.cuda()
+    init_ts = self.init_ts
     # 1 x n_lits x dim & 1 x n_clauses x dim
     L_init = self.L_init(init_ts).view(1, 1, -1)
     # print(L_init.shape)
@@ -46,9 +47,9 @@ class NeuroSAT(nn.Module):
 
     # print(L_init.shape, C_init.shape)
 
-    L_state = (L_init, torch.zeros(1, n_lits, self.args.dim).cuda())
-    C_state = (C_init, torch.zeros(1, n_clauses, self.args.dim).cuda())
-    L_unpack  = torch.sparse.FloatTensor(ts_L_unpack_indices, torch.ones(problem.n_cells), torch.Size([n_lits, n_clauses])).to_dense().cuda()
+    L_state = (L_init, torch.zeros(1, n_lits, self.args.dim, device=self.device))
+    C_state = (C_init, torch.zeros(1, n_clauses, self.args.dim, device=self.device))
+    L_unpack  = torch.sparse.FloatTensor(ts_L_unpack_indices, torch.ones(problem.n_cells, device=self.device), torch.Size([n_lits, n_clauses])).to_dense()
 
     # print(ts_L_unpack_indices.shape)
 

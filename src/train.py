@@ -16,7 +16,7 @@ from config import parser
 args = parser.parse_args()
 
 net = NeuroSAT(args)
-net = net.cuda()
+net = net.cpu()
 
 task_name = args.task_name + '_sr' + str(args.min_n) + 'to' + str(args.max_n) + '_ep' + str(args.epochs) + '_nr' + str(args.n_rounds) + '_d' + str(args.dim)
 log_file = open(os.path.join(args.log_dir, task_name+'.log'), 'a+')
@@ -63,7 +63,7 @@ for epoch in range(start_epoch, args.epochs):
   for _, prob in enumerate(train_bar):
     optim.zero_grad()
     outputs = net(prob)
-    target = torch.Tensor(prob.is_sat).cuda().float()
+    target = torch.Tensor(prob.is_sat).cpu().float()
     # print(outputs.shape, target.shape)
     # print(outputs, target)
     outputs = sigmoid(outputs)
@@ -73,7 +73,7 @@ for epoch in range(start_epoch, args.epochs):
     loss.backward()
     optim.step()
 
-    preds = torch.where(outputs>0.5, torch.ones(outputs.shape).cuda(), torch.zeros(outputs.shape).cuda())
+    preds = torch.where(outputs>0.5, torch.ones(outputs.shape).cpu(), torch.zeros(outputs.shape).cpu())
 
     TP += (preds.eq(1) & target.eq(1)).cpu().sum()
     TN += (preds.eq(0) & target.eq(0)).cpu().sum()
@@ -93,11 +93,11 @@ for epoch in range(start_epoch, args.epochs):
   for _, prob in enumerate(val_bar):
     optim.zero_grad()
     outputs = net(prob)
-    target = torch.Tensor(prob.is_sat).cuda().float()
+    target = torch.Tensor(prob.is_sat).cpu().float()
     # print(outputs.shape, target.shape)
     # print(outputs, target)
     outputs = sigmoid(outputs)
-    preds = torch.where(outputs>0.5, torch.ones(outputs.shape).cuda(), torch.zeros(outputs.shape).cuda())
+    preds = torch.where(outputs>0.5, torch.ones(outputs.shape).cpu(), torch.zeros(outputs.shape).cpu())
 
     TP += (preds.eq(1) & target.eq(1)).cpu().sum()
     TN += (preds.eq(0) & target.eq(0)).cpu().sum()
