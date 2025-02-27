@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 from mlp import MLP
 
@@ -51,7 +52,8 @@ class NeuroSAT(nn.Module):
     # print(n_vars, n_lits, n_clauses, n_probs)
 
     # Ensure all tensors are moved to the correct device
-    ts_L_unpack_indices = torch.tensor(problem.L_unpack_indices, device=self.device).t().long()
+    # Convert list of arrays to single numpy array for better performance
+    ts_L_unpack_indices = torch.tensor(np.array(problem.L_unpack_indices), device=self.device).t().long()
     
     init_ts = self.init_ts
     # 1 x n_lits x dim & 1 x n_clauses x dim
@@ -132,4 +134,3 @@ class NeuroSAT(nn.Module):
     # Ensure tensors are on the correct device
     msg = msg.to(self.device)
     return torch.cat([msg[n_vars:2*n_vars, :], msg[:n_vars, :]], dim=0).to(self.device)
-
