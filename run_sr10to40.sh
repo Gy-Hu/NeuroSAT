@@ -36,13 +36,16 @@ fi
 
 # Step 3: Run the training script
 echo "Starting training on SR(10-40) dataset..."
+# Set environment variable to allow unlimited memory for MPS
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+
 python src/train.py \
   --task-name 'neurosat_4th_rnd' \
   --dim 128 \
   --n_rounds 26 \
   --epochs 200 \
   --n_pairs 100000 \
-  --max_nodes_per_batch 12000 \
+  --max_nodes_per_batch 3000 \
   --data-dir '/Users/apple/coding_env/NeuroSAT/data' \
   --log-dir '/Users/apple/coding_env/NeuroSAT/log' \
   --model-dir '/Users/apple/coding_env/NeuroSAT/model' \

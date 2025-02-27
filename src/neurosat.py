@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import gc
 
 from mlp import MLP
 
@@ -61,6 +62,9 @@ class NeuroSAT(nn.Module):
     # print(L_init.shape)
     L_init = L_init.repeat(1, n_lits, 1)
     C_init = self.C_init(init_ts).view(1, 1, -1)
+    # Free memory after initialization
+    init_ts = None
+    gc.collect()
     # print(C_init.shape)
     C_init = C_init.repeat(1, n_clauses, 1)
 
@@ -77,9 +81,13 @@ class NeuroSAT(nn.Module):
     # MPS doesn't support sparse tensors, so we need to handle this differently
     if self.device.type == 'mps':
         # Create a dense tensor directly without going through sparse format
-        L_unpack = torch.zeros(n_lits, n_clauses, device=self.device)
+        # Use float16 for better memory efficiency on MPS
+        L_unpack = torch.zeros(n_lits, n_clauses, dtype=torch.float32, device=self.device)
         for i in range(len(problem.L_unpack_indices[0])):
             L_unpack[ts_L_unpack_indices[0, i], ts_L_unpack_indices[1, i]] = 1.0
+        # Free memory after creating L_unpack
+        ts_L_unpack_indices = None
+        gc.collect()
     else:
         L_unpack = torch.sparse.FloatTensor(
             ts_L_unpack_indices,
@@ -91,38 +99,76 @@ class NeuroSAT(nn.Module):
 
     for _ in range(self.args.n_rounds):
       # n_lits x dim
+      # Clear cache before each round to reduce memory usage
+      if self.device.type == 'mps':
+        if hasattr(torch.mps, 'empty_cache'):
+          torch.mps.empty_cache()
+      elif self.device.type == 'cuda':
+        torch.cuda.empty_cache()
+        
       L_hidden = L_state[0].squeeze(0).to(self.device)
       L_pre_msg = self.L_msg(L_hidden)
+      
       # (n_clauses x n_lits) x (n_lits x dim) = n_clauses x dim
-      LC_msg = torch.matmul(L_unpack.t().to(self.device), L_pre_msg.to(self.device))
+      # Use more memory-efficient matrix multiplication
+      L_unpack_t = L_unpack.t()
+      LC_msg = torch.matmul(L_unpack_t, L_pre_msg)
+      L_unpack_t = None
+      L_pre_msg = None
+      gc.collect()
       # print(L_hidden.shape, L_pre_msg.shape, LC_msg.shape)
 
       # Make sure LSTM input is on the correct device
-      LC_msg = LC_msg.to(self.device)
+      # Use half precision for LSTM operations to save memory on MPS
+      # LSTM requires float32 input, so we can't use float16 here
       _, C_state = self.C_update(LC_msg.unsqueeze(0), C_state)
+      
+      LC_msg = None
+      gc.collect()
       # print('C_state',C_state[0].shape, C_state[1].shape)
 
       # n_clauses x dim
       C_hidden = C_state[0].squeeze(0).to(self.device)
       C_pre_msg = self.C_msg(C_hidden)
       # (n_lits x n_clauses) x (n_clauses x dim) = n_lits x dim
-      CL_msg = torch.matmul(L_unpack.to(self.device), C_pre_msg.to(self.device))
+      CL_msg = torch.matmul(L_unpack, C_pre_msg)
+      C_pre_msg = None
+      gc.collect()
       # print(C_hidden.shape, C_pre_msg.shape, CL_msg.shape)
 
       # Create the concatenated tensor for LSTM input
       flipped = self.flip(L_state[0].squeeze(0), n_vars)
-      cat_tensor = torch.cat([CL_msg.to(self.device), flipped.to(self.device)], dim=1).to(self.device)
+      cat_tensor = torch.cat([CL_msg, flipped], dim=1)
+      CL_msg = None
+      flipped = None
+      
+      # LSTM requires float32 input
       _, L_state = self.L_update(cat_tensor.unsqueeze(0), L_state)
+      
+      cat_tensor = None
+      gc.collect()
       # print('L_state',C_state[0].shape, C_state[1].shape)
       
     # Ensure final tensors are on correct device
     logits = L_state[0].squeeze(0).to(self.device)
     clauses = C_state[0].squeeze(0).to(self.device)
+    
+    # Free memory before final computation
+    L_state = None
+    C_state = None
+    L_unpack = None
+    gc.collect()
 
     # print(logits.shape, clauses.shape)
     vote = self.L_vote(logits)
     # print('vote', vote.shape)
     vote_join = torch.cat([vote[:n_vars, :], vote[n_vars:, :]], dim=1).to(self.device)
+    
+    vote = None
+    logits = None
+    clauses = None
+    gc.collect()
+    
     # print('vote_join', vote_join.shape)
     self.vote = vote_join
     vote_join = vote_join.view(n_probs, -1, 2).view(n_probs, -1)
@@ -134,3 +180,9 @@ class NeuroSAT(nn.Module):
     # Ensure tensors are on the correct device
     msg = msg.to(self.device)
     return torch.cat([msg[n_vars:2*n_vars, :], msg[:n_vars, :]], dim=0).to(self.device)
+    
+  def __del__(self):
+    # Clean up memory when the model is deleted
+    if hasattr(torch.mps, 'empty_cache'):
+      torch.mps.empty_cache()
+    gc.collect()
