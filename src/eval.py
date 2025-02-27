@@ -2,6 +2,7 @@ import argparse
 import pickle
 import os
 import time
+import platform
 from tqdm import tqdm
 
 import numpy as np
@@ -17,27 +18,37 @@ import mk_problem
 from config import parser
 
 def load_model(args, log_file=None):
-  net = NeuroSAT(args)
-  net = net.cuda()
+  # Add MPS (Metal Performance Shaders) support for macOS
+  if platform.system() == 'Darwin' and torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print("Using MPS (Metal Performance Shaders) for evaluation")
+  elif torch.cuda.is_available():
+    device = torch.device('cuda')
+    print("Using CUDA for evaluation")
+  else:
+    device = torch.device('cpu')
+    print("Using CPU for evaluation")
+    
+  net = NeuroSAT(args, device=device)
   if args.restore:
     if log_file is not None:
       print('restoring from', args.restore, file=log_file, flush=True)
-    model = torch.load(args.restore)
+    model = torch.load(args.restore, map_location=device)
     net.load_state_dict(model['state_dict'])
   
-  return net
+  return net, device
 
-def predict(net, data):
+def predict(net, data, device):
     net.eval()
     outputs = net(data)
     probs = net.vote
-    preds = torch.where(outputs>0.5, torch.ones(outputs.shape).cuda(), torch.zeros(outputs.shape).cuda())
+    preds = torch.where(outputs>0.5, torch.ones(outputs.shape, device=device), torch.zeros(outputs.shape, device=device))
     return preds.cpu().detach().numpy(), probs.cpu().detach().numpy()
 
 if __name__ == '__main__':
   args = parser.parse_args()
   log_file = open(os.path.join(args.log_dir, args.task_name+'.log'), 'a+')
-  net = load_model(args)
+  net, device = load_model(args, log_file)
 
   TP, TN, FN, FP = 0, 0, 0, 0
   times = []
@@ -47,7 +58,7 @@ if __name__ == '__main__':
 
     for x in xs:
       start_time = time.time()
-      preds, probs = predict(net, x)
+      preds, probs = predict(net, x, device)
       end_time   = time.time()
       duration = (end_time - start_time) * 1000
       times.append(duration)

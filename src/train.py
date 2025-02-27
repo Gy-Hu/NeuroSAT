@@ -2,6 +2,7 @@ import argparse
 import pickle
 import os
 from tqdm import tqdm
+import platform
 
 import torch
 import torch.nn as nn
@@ -15,8 +16,18 @@ from config import parser
 
 args = parser.parse_args()
 
-net = NeuroSAT(args)
-net = net.cpu()
+# Add MPS (Metal Performance Shaders) support for macOS
+if platform.system() == 'Darwin' and torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print("Using MPS (Metal Performance Shaders) for training")
+elif torch.cuda.is_available():
+    device = torch.device('cuda')
+    print("Using CUDA for training")
+else:
+    device = torch.device('cpu')
+    print("Using CPU for training")
+
+net = NeuroSAT(args, device=device)
 
 task_name = args.task_name + '_sr' + str(args.min_n) + 'to' + str(args.max_n) + '_ep' + str(args.epochs) + '_nr' + str(args.n_rounds) + '_d' + str(args.dim)
 log_file = open(os.path.join(args.log_dir, task_name+'.log'), 'a+')
@@ -44,7 +55,7 @@ print('num of val batches: ', len(val), file=log_file, flush=True)
 
 if args.restore is not None:
   print('restoring from', args.restore, file=log_file, flush=True)
-  model = torch.load(args.restore)
+  model = torch.load(args.restore, map_location=device)
   start_epoch = model['epoch']
   best_acc = model['acc']
   net.load_state_dict(model['state_dict'])
@@ -58,27 +69,28 @@ for epoch in range(start_epoch, args.epochs):
   print('==> %d/%d epoch, previous best: %.3f' % (epoch+1, args.epochs, best_acc), file=log_file, flush=True)
   print('==> %d/%d epoch, previous best: %.3f' % (epoch+1, args.epochs, best_acc), file=detail_log_file, flush=True)
   train_bar = tqdm(train)
-  TP, TN, FN, FP = torch.zeros(1).long(), torch.zeros(1).long(), torch.zeros(1).long(), torch.zeros(1).long()
+  TP, TN, FN, FP = torch.zeros(1, device=device).long(), torch.zeros(1, device=device).long(), torch.zeros(1, device=device).long(), torch.zeros(1, device=device).long()
   net.train()
   for _, prob in enumerate(train_bar):
     optim.zero_grad()
     outputs = net(prob)
-    target = torch.Tensor(prob.is_sat).cpu().float()
+    target = torch.tensor(prob.is_sat, device=device).float()
     # print(outputs.shape, target.shape)
     # print(outputs, target)
     outputs = sigmoid(outputs)
-    loss = loss_fn(outputs, target)
+    # Make sure both outputs and target are on the same device
+    loss = loss_fn(outputs, target.to(outputs.device))
     desc = 'loss: %.4f; ' % (loss.item())
 
     loss.backward()
     optim.step()
 
-    preds = torch.where(outputs>0.5, torch.ones(outputs.shape).cpu(), torch.zeros(outputs.shape).cpu())
+    preds = torch.where(outputs>0.5, torch.ones(outputs.shape, device=device), torch.zeros(outputs.shape, device=device))
 
-    TP += (preds.eq(1) & target.eq(1)).cpu().sum()
-    TN += (preds.eq(0) & target.eq(0)).cpu().sum()
-    FN += (preds.eq(0) & target.eq(1)).cpu().sum()
-    FP += (preds.eq(1) & target.eq(0)).cpu().sum()
+    TP += (preds.eq(1) & target.eq(1)).sum()
+    TN += (preds.eq(0) & target.eq(0)).sum()
+    FN += (preds.eq(0) & target.eq(1)).sum()
+    FP += (preds.eq(1) & target.eq(0)).sum()
     TOT = TP + TN + FN + FP
     
     desc += 'acc: %.3f, TP: %.3f, TN: %.3f, FN: %.3f, FP: %.3f' % ((TP.item()+TN.item())*1.0/TOT.item(), TP.item()*1.0/TOT.item(), TN.item()*1.0/TOT.item(), FN.item()*1.0/TOT.item(), FP.item()*1.0/TOT.item())
@@ -88,21 +100,24 @@ for epoch in range(start_epoch, args.epochs):
   print(desc, file=log_file, flush=True)
   
   val_bar = tqdm(val)
-  TP, TN, FN, FP = torch.zeros(1).long(), torch.zeros(1).long(), torch.zeros(1).long(), torch.zeros(1).long()
+  TP, TN, FN, FP = torch.zeros(1, device=device).long(), torch.zeros(1, device=device).long(), torch.zeros(1, device=device).long(), torch.zeros(1, device=device).long()
   net.eval()
   for _, prob in enumerate(val_bar):
     optim.zero_grad()
     outputs = net(prob)
-    target = torch.Tensor(prob.is_sat).cpu().float()
+    target = torch.Tensor(prob.is_sat).to(device).float()
     # print(outputs.shape, target.shape)
     # print(outputs, target)
     outputs = sigmoid(outputs)
-    preds = torch.where(outputs>0.5, torch.ones(outputs.shape).cpu(), torch.zeros(outputs.shape).cpu())
+    # Make sure both outputs and target are on the same device for loss calculation
+    outputs = outputs.to(device)
+    target = target.to(device)
+    preds = torch.where(outputs>0.5, torch.ones(outputs.shape, device=device), torch.zeros(outputs.shape, device=device))
 
-    TP += (preds.eq(1) & target.eq(1)).cpu().sum()
-    TN += (preds.eq(0) & target.eq(0)).cpu().sum()
-    FN += (preds.eq(0) & target.eq(1)).cpu().sum()
-    FP += (preds.eq(1) & target.eq(0)).cpu().sum()
+    TP += (preds.eq(1) & target.eq(1)).sum()
+    TN += (preds.eq(0) & target.eq(0)).sum()
+    FN += (preds.eq(0) & target.eq(1)).sum()
+    FP += (preds.eq(1) & target.eq(0)).sum()
     TOT = TP + TN + FN + FP
     
     desc = 'acc: %.3f, TP: %.3f, TN: %.3f, FN: %.3f, FP: %.3f' % ((TP.item()+TN.item())*1.0/TOT.item(), TP.item()*1.0/TOT.item(), TN.item()*1.0/TOT.item(), FN.item()*1.0/TOT.item(), FP.item()*1.0/TOT.item())

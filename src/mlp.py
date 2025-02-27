@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class MLP(nn.Module):
   def __init__(self, in_dim, hidden_dim, out_dim):
@@ -9,8 +10,13 @@ class MLP(nn.Module):
     self.l3 = nn.Linear(hidden_dim, out_dim)
 
   def forward(self, x):
-    x = self.l1(x)
-    x = self.l2(x)
+    # Make sure the input is on the same device as the weights
+    device = self.l1.weight.device
+    if x.device != device:
+      x = x.to(device)
+      
+    x = F.relu(self.l1(x))
+    x = F.relu(self.l2(x))
     x = self.l3(x)
 
     return x

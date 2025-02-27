@@ -4,10 +4,11 @@ import torch.nn as nn
 from mlp import MLP
 
 class NeuroSAT(nn.Module):
-  def __init__(self, args):
+  def __init__(self, args, device=None):
     super(NeuroSAT, self).__init__()
     self.args = args
-    self.device = torch.device('cpu')
+    # Use the provided device or default to CPU
+    self.device = device if device is not None else torch.device('cpu')
 
     self.init_ts = torch.ones(1, device=self.device)
     self.init_ts.requires_grad = False
@@ -25,16 +26,32 @@ class NeuroSAT(nn.Module):
 
     self.L_vote = MLP(self.args.dim, self.args.dim, 1)
 
-    self.denom = torch.sqrt(torch.Tensor([self.args.dim]))
+    self.denom = torch.sqrt(torch.tensor([self.args.dim], device=self.device))
+    
+    # Move all model parameters to the specified device
+    self.to(self.device)
+    
+  # Add helper method to move problem data to device
+  def _move_problem_to_device(self, problem):
+    # This is a simple object with attributes, not a proper PyTorch structure with a to() method
+    # So we manually move its tensor components
+    # We preserve the object itself and just change its tensor attributes
+    if hasattr(problem, "L_unpack_indices"):
+      problem.L_unpack_indices = [idx for idx in problem.L_unpack_indices]  # Keep this as a list
+    return problem
 
   def forward(self, problem):
+    # Move problem data to the correct device
+    problem = self._move_problem_to_device(problem)
+    
     n_vars    = problem.n_vars
     n_lits    = problem.n_lits
     n_clauses = problem.n_clauses
     n_probs   = len(problem.is_sat)
     # print(n_vars, n_lits, n_clauses, n_probs)
 
-    ts_L_unpack_indices = torch.Tensor(problem.L_unpack_indices).t().long().to(self.device)
+    # Ensure all tensors are moved to the correct device
+    ts_L_unpack_indices = torch.tensor(problem.L_unpack_indices, device=self.device).t().long()
     
     init_ts = self.init_ts
     # 1 x n_lits x dim & 1 x n_clauses x dim
@@ -47,47 +64,72 @@ class NeuroSAT(nn.Module):
 
     # print(L_init.shape, C_init.shape)
 
-    L_state = (L_init, torch.zeros(1, n_lits, self.args.dim, device=self.device))
-    C_state = (C_init, torch.zeros(1, n_clauses, self.args.dim, device=self.device))
-    L_unpack  = torch.sparse.FloatTensor(ts_L_unpack_indices, torch.ones(problem.n_cells, device=self.device), torch.Size([n_lits, n_clauses])).to_dense()
+    # Make sure all LSTM states are on the correct device
+    h0_L = L_init.to(self.device)
+    c0_L = torch.zeros(1, n_lits, self.args.dim, device=self.device)
+    L_state = (h0_L, c0_L)
+    
+    h0_C = C_init.to(self.device)
+    c0_C = torch.zeros(1, n_clauses, self.args.dim, device=self.device)
+    C_state = (h0_C, c0_C)
+    # MPS doesn't support sparse tensors, so we need to handle this differently
+    if self.device.type == 'mps':
+        # Create a dense tensor directly without going through sparse format
+        L_unpack = torch.zeros(n_lits, n_clauses, device=self.device)
+        for i in range(len(problem.L_unpack_indices[0])):
+            L_unpack[ts_L_unpack_indices[0, i], ts_L_unpack_indices[1, i]] = 1.0
+    else:
+        L_unpack = torch.sparse.FloatTensor(
+            ts_L_unpack_indices,
+            torch.ones(problem.n_cells, device=self.device),
+            torch.Size([n_lits, n_clauses])
+        ).to_dense().to(self.device)
 
     # print(ts_L_unpack_indices.shape)
 
     for _ in range(self.args.n_rounds):
       # n_lits x dim
-      L_hidden = L_state[0].squeeze(0)
+      L_hidden = L_state[0].squeeze(0).to(self.device)
       L_pre_msg = self.L_msg(L_hidden)
       # (n_clauses x n_lits) x (n_lits x dim) = n_clauses x dim
-      LC_msg = torch.matmul(L_unpack.t(), L_pre_msg)
+      LC_msg = torch.matmul(L_unpack.t().to(self.device), L_pre_msg.to(self.device))
       # print(L_hidden.shape, L_pre_msg.shape, LC_msg.shape)
 
-      _, C_state= self.C_update(LC_msg.unsqueeze(0), C_state)
+      # Make sure LSTM input is on the correct device
+      LC_msg = LC_msg.to(self.device)
+      _, C_state = self.C_update(LC_msg.unsqueeze(0), C_state)
       # print('C_state',C_state[0].shape, C_state[1].shape)
 
       # n_clauses x dim
-      C_hidden = C_state[0].squeeze(0)
+      C_hidden = C_state[0].squeeze(0).to(self.device)
       C_pre_msg = self.C_msg(C_hidden)
       # (n_lits x n_clauses) x (n_clauses x dim) = n_lits x dim
-      CL_msg = torch.matmul(L_unpack, C_pre_msg)
+      CL_msg = torch.matmul(L_unpack.to(self.device), C_pre_msg.to(self.device))
       # print(C_hidden.shape, C_pre_msg.shape, CL_msg.shape)
 
-      _, L_state= self.L_update(torch.cat([CL_msg, self.flip(L_state[0].squeeze(0), n_vars)], dim=1).unsqueeze(0), L_state)
+      # Create the concatenated tensor for LSTM input
+      flipped = self.flip(L_state[0].squeeze(0), n_vars)
+      cat_tensor = torch.cat([CL_msg.to(self.device), flipped.to(self.device)], dim=1).to(self.device)
+      _, L_state = self.L_update(cat_tensor.unsqueeze(0), L_state)
       # print('L_state',C_state[0].shape, C_state[1].shape)
       
-    logits = L_state[0].squeeze(0)
-    clauses = C_state[0].squeeze(0)
+    # Ensure final tensors are on correct device
+    logits = L_state[0].squeeze(0).to(self.device)
+    clauses = C_state[0].squeeze(0).to(self.device)
 
     # print(logits.shape, clauses.shape)
     vote = self.L_vote(logits)
     # print('vote', vote.shape)
-    vote_join = torch.cat([vote[:n_vars, :], vote[n_vars:, :]], dim=1)
+    vote_join = torch.cat([vote[:n_vars, :], vote[n_vars:, :]], dim=1).to(self.device)
     # print('vote_join', vote_join.shape)
     self.vote = vote_join
     vote_join = vote_join.view(n_probs, -1, 2).view(n_probs, -1)
     vote_mean = torch.mean(vote_join, dim=1)
     # print('mean', vote_mean.shape)
-    return vote_mean
+    return vote_mean.to(self.device)
 
   def flip(self, msg, n_vars):
-    return torch.cat([msg[n_vars:2*n_vars, :], msg[:n_vars, :]], dim=0)
+    # Ensure tensors are on the correct device
+    msg = msg.to(self.device)
+    return torch.cat([msg[n_vars:2*n_vars, :], msg[:n_vars, :]], dim=0).to(self.device)
 
