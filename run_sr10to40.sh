@@ -9,31 +9,42 @@
 # Create directories if they don't exist
 mkdir -p data/train
 mkdir -p log
+mkdir -p data/val
 
-# Step 1: Generate the dataset using data_maker.py
+# Step 1: Generate the training dataset using data_maker.py
 echo "Generating SR(10-40) dataset for training..."
 python src/data_maker.py \
   data/train/sr10-40.pkl \
   log/data_maker_sr10t40.log \
-  10000 \
+  100000 \
   50000 \
   --min_n 10 \
   --max_n 40 \
   --p_k_2 0.3 \
   --p_geo 0.4
 
-# Step 2: Run the training script
+# Step 2: Generate validation dataset if it doesn't exist
+if [ ! -f "data/val/sr40.pkl" ]; then
+  echo "Generating SR(40) dataset for validation..."
+  python src/data_maker.py \
+    data/val/sr40.pkl \
+    log/data_maker_val_sr40.log \
+    1000 \
+    50000 \
+    --min_n 40 --max_n 40
+fi
+
+# Step 3: Run the training script
 echo "Starting training on SR(10-40) dataset..."
 python src/train.py \
   --task-name 'neurosat_4th_rnd' \
   --dim 128 \
   --n_rounds 26 \
   --epochs 200 \
-  --n_pairs 10000 \
+  --n_pairs 100000 \
   --max_nodes_per_batch 12000 \
   --data-dir '/Users/apple/coding_env/NeuroSAT/data' \
   --log-dir '/Users/apple/coding_env/NeuroSAT/log' \
-  --model-dir '/Users/apple/coding_env/NeuroSAT/model'
-  # Uncomment to use validation data and/or restore from a checkpoint
-  # --val-file 'val_v40_vpb12000_b2604.pkl' \
+  --model-dir '/Users/apple/coding_env/NeuroSAT/model' \
+  --val-file 'sr40.pkl'
   # --restore '/Users/apple/coding_env/NeuroSAT/model/neurosat_3rd_rnd_sr10to40_ep200_nr26_d128.pth.tar'

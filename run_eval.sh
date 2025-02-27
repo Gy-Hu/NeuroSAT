@@ -11,12 +11,12 @@ mkdir -p data/eval
 mkdir -p log
 
 # Step 1: Generate the evaluation dataset (SR(40)) using data_maker.py
-echo "Generating SR(40) dataset for evaluation..."
+echo "Generating SR(40) evaluation dataset..."
 python src/data_maker.py \
   data/eval/sr40.pkl \
   log/data_maker_eval_sr40.log \
   1000 \
-  50000 \
+  12000 \
   --min_n 40 \
   --max_n 40 \
   --p_k_2 0.3 \
@@ -29,4 +29,5 @@ python src/eval.py \
   --dim 128 \
   --n_rounds 1024 \
   --restore '/Users/apple/coding_env/NeuroSAT/model/neurosat_3rd_rnd_sr10to40_ep200_nr26_d128.pth.tar' \
-  --data-dir '/Users/apple/coding_env/NeuroSAT/data/eval'
+  --data-file '/Users/apple/coding_env/NeuroSAT/data/eval/sr40.pkl' \
+  --log-dir '/Users/apple/coding_env/NeuroSAT/log'
